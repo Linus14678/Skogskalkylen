@@ -357,6 +357,7 @@
       <input type="text" id="jobName" placeholder="T.ex. Trakt Bäckaskog">
       <button type="button" id="saveJobBtn" class="job-save-btn">Spara jobb</button>
     </div>
+    <p id="jobStatus" class="job-empty" aria-live="polite"></p>
   </div>
  
   <div class="hero">
@@ -645,23 +646,75 @@ ids.forEach(id => document.getElementById(id).addEventListener('input', calculat
 loadInputs();
  
 const JOBS_KEY = 'saved_jobs';
+const SUPABASE_URL = 'https://ynetfkbxtzragccpjzjr.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_NeNOTpF3cx3RrimXISYHIg_zIr5JSd-';
+const JOBS_ENDPOINT = SUPABASE_URL + '/rest/v1/jobs';
 let savedJobs = [];
 let activeJobId = null;
+let remoteJobsAvailable = true;
+
+function setJobStatus(message){
+  document.getElementById('jobStatus').textContent = message;
+}
+
+async function supabaseRequest(path = '', options = {}){
+  const response = await fetch(JOBS_ENDPOINT + path, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: 'Bearer ' + SUPABASE_KEY,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+  if(!response.ok) throw new Error('Supabase request failed: ' + response.status);
+  return response.status === 204 ? null : response.json();
+}
  
 async function loadJobs(){
   try{
-    const raw = localStorage.getItem(JOBS_KEY);
-    savedJobs = raw ? JSON.parse(raw) : [];
+    const remoteJobs = await supabaseRequest('?select=id,name,data,updated_at&order=updated_at.desc');
+    savedJobs = remoteJobs.map(job => ({
+      id: job.id,
+      name: job.name,
+      data: job.data,
+      updatedAt: new Date(job.updated_at).getTime()
+    }));
+    localStorage.setItem(JOBS_KEY, JSON.stringify(savedJobs));
+    setJobStatus('Ansluten till servern');
   }catch(e){
-    savedJobs = [];
+    remoteJobsAvailable = false;
+    try{
+      const raw = localStorage.getItem(JOBS_KEY);
+      savedJobs = raw ? JSON.parse(raw) : [];
+    }catch(storageError){
+      savedJobs = [];
+    }
+    setJobStatus('Servern kunde inte nås. Visar lokalt sparade jobb.');
   }
   renderJobList();
 }
  
-async function persistJobs(){
+async function persistJobs(job){
   try{
     localStorage.setItem(JOBS_KEY, JSON.stringify(savedJobs));
-  }catch(e){}
+    if(remoteJobsAvailable){
+      await supabaseRequest('?on_conflict=id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates' },
+        body: JSON.stringify({
+          id: job.id,
+          name: job.name,
+          data: job.data,
+          updated_at: new Date(job.updatedAt).toISOString()
+        })
+      });
+      setJobStatus('Sparat på servern');
+    }
+  }catch(e){
+    remoteJobsAvailable = false;
+    setJobStatus('Kunde inte spara på servern. Sparat lokalt i stället.');
+  }
 }
  
 function renderJobList(){
@@ -711,14 +764,23 @@ function openJob(id){
   document.getElementById('jobMenu').classList.remove('open');
 }
  
-function deleteJob(id){
+async function deleteJob(id){
   savedJobs = savedJobs.filter(j => j.id !== id);
   if(activeJobId === id) activeJobId = null;
-  persistJobs();
+  try{
+    localStorage.setItem(JOBS_KEY, JSON.stringify(savedJobs));
+    if(remoteJobsAvailable){
+      await supabaseRequest('?id=eq.' + encodeURIComponent(id), { method: 'DELETE' });
+      setJobStatus('Jobbet togs bort från servern');
+    }
+  }catch(e){
+    remoteJobsAvailable = false;
+    setJobStatus('Kunde inte ta bort jobbet från servern.');
+  }
   renderJobList();
 }
  
-function saveCurrentJob(){
+async function saveCurrentJob(){
   const nameInput = document.getElementById('jobName');
   const name = nameInput.value.trim();
   if(!name) return;
@@ -735,8 +797,9 @@ function saveCurrentJob(){
     const job = { id: Date.now().toString(36) + Math.random().toString(36).slice(2,7), name, data, updatedAt: Date.now() };
     savedJobs.push(job);
     activeJobId = job.id;
+    await persistJobs(job);
   }
-  persistJobs();
+  if(existing) await persistJobs(existing);
   renderJobList();
 }
  
